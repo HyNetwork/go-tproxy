@@ -8,7 +8,11 @@ import (
 	"os"
 	"strconv"
 	"syscall"
-	"unsafe"
+)
+
+const (
+	IPV6_TRANSPARENT     = 75
+	IPV6_RECVORIGDSTADDR = 74
 )
 
 // ListenUDP will construct a new UDP listener
@@ -35,6 +39,14 @@ func ListenUDP(network string, laddr *net.UDPAddr) (*net.UDPConn, error) {
 		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_RECVORIGDSTADDR: %s", err)}
 	}
 
+	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_TRANSPARENT, 1); err != nil {
+		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IPV6_TRANSPARENT: %s", err)}
+	}
+
+	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_RECVORIGDSTADDR, 1); err != nil {
+		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IPV6_RECVORIGDSTADDR: %s", err)}
+	}
+
 	return listener, nil
 }
 
@@ -56,6 +68,10 @@ func ReadFromUDP(conn *net.UDPConn, b []byte) (int, *net.UDPAddr, *net.UDPAddr, 
 		return 0, nil, nil, fmt.Errorf("parsing socket control message: %s", err)
 	}
 
+	ntohs := func(n uint16) uint16 {
+		return (n >> 8) | (n << 8)
+	}
+
 	var originalDst *net.UDPAddr
 	for _, msg := range msgs {
 		if msg.Header.Level == syscall.SOL_IP && msg.Header.Type == syscall.IP_RECVORIGDSTADDR {
@@ -63,27 +79,19 @@ func ReadFromUDP(conn *net.UDPConn, b []byte) (int, *net.UDPAddr, *net.UDPAddr, 
 			if err = binary.Read(bytes.NewReader(msg.Data), binary.LittleEndian, originalDstRaw); err != nil {
 				return 0, nil, nil, fmt.Errorf("reading original destination address: %s", err)
 			}
-
-			switch originalDstRaw.Family {
-			case syscall.AF_INET:
-				pp := (*syscall.RawSockaddrInet4)(unsafe.Pointer(originalDstRaw))
-				p := (*[2]byte)(unsafe.Pointer(&pp.Port))
-				originalDst = &net.UDPAddr{
-					IP:   net.IPv4(pp.Addr[0], pp.Addr[1], pp.Addr[2], pp.Addr[3]),
-					Port: int(p[0])<<8 + int(p[1]),
-				}
-
-			case syscall.AF_INET6:
-				pp := (*syscall.RawSockaddrInet6)(unsafe.Pointer(originalDstRaw))
-				p := (*[2]byte)(unsafe.Pointer(&pp.Port))
-				originalDst = &net.UDPAddr{
-					IP:   net.IP(pp.Addr[:]),
-					Port: int(p[0])<<8 + int(p[1]),
-					Zone: strconv.Itoa(int(pp.Scope_id)),
-				}
-
-			default:
-				return 0, nil, nil, fmt.Errorf("original destination is an unsupported network family")
+			originalDst = &net.UDPAddr{
+				IP:   net.IPv4(originalDstRaw.Addr[0], originalDstRaw.Addr[1], originalDstRaw.Addr[2], originalDstRaw.Addr[3]),
+				Port: int(ntohs(originalDstRaw.Port)),
+			}
+		} else if msg.Header.Level == syscall.SOL_IPV6 && msg.Header.Type == IPV6_RECVORIGDSTADDR {
+			originalDstRaw := &syscall.RawSockaddrInet6{}
+			if err = binary.Read(bytes.NewReader(msg.Data), binary.LittleEndian, originalDstRaw); err != nil {
+				return 0, nil, nil, fmt.Errorf("reading original destination address: %s", err)
+			}
+			originalDst = &net.UDPAddr{
+				IP:   originalDstRaw.Addr[:],
+				Port: int(ntohs(originalDstRaw.Port)),
+				Zone: strconv.Itoa(int(originalDstRaw.Scope_id)),
 			}
 		}
 	}
@@ -119,9 +127,16 @@ func DialUDP(network string, laddr *net.UDPAddr, raddr *net.UDPAddr) (*net.UDPCo
 		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("set socket option: SO_REUSEADDR: %s", err)}
 	}
 
-	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
-		syscall.Close(fileDescriptor)
-		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
+	if laddr.IP.To4() != nil {
+		if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
+			syscall.Close(fileDescriptor)
+			return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
+		}
+	} else {
+		if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_TRANSPARENT, 1); err != nil {
+			syscall.Close(fileDescriptor)
+			return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("set socket option: IPV6_TRANSPARENT: %s", err)}
+		}
 	}
 
 	if err = syscall.Bind(fileDescriptor, localSocketAddress); err != nil {
@@ -142,7 +157,7 @@ func DialUDP(network string, laddr *net.UDPAddr, raddr *net.UDPAddr) (*net.UDPCo
 		syscall.Close(fileDescriptor)
 		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("convert file descriptor to connection: %s", err)}
 	}
-	
+
 	return remoteConn.(*net.UDPConn), nil
 }
 
@@ -163,7 +178,7 @@ func udpAddrToSocketAddr(addr *net.UDPAddr) (syscall.Sockaddr, error) {
 
 		zoneID, err := strconv.ParseUint(addr.Zone, 10, 32)
 		if err != nil {
-			return nil, err
+			zoneID = 0
 		}
 
 		return &syscall.SockaddrInet6{Addr: ip, Port: addr.Port, ZoneId: uint32(zoneID)}, nil
