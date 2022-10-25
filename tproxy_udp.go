@@ -39,11 +39,11 @@ func ListenUDP(network string, laddr *net.UDPAddr) (*net.UDPConn, error) {
 		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_RECVORIGDSTADDR: %s", err)}
 	}
 
-	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_TRANSPARENT, 1); err != nil {
+	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_TRANSPARENT, 1); err != nil && err != syscall.ENOPROTOOPT {
 		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IPV6_TRANSPARENT: %s", err)}
 	}
 
-	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_RECVORIGDSTADDR, 1); err != nil {
+	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IPV6, IPV6_RECVORIGDSTADDR, 1); err != nil && err != syscall.ENOPROTOOPT {
 		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IPV6_RECVORIGDSTADDR: %s", err)}
 	}
 
